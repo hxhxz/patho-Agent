@@ -32,7 +32,7 @@ class WSICoordinateMapper:
     """处理多尺度坐标映射 + WSI 实际读取"""
 
     def __init__(self, wsi_path: str):
-        self.wsi = openslide.OpenSlide(wsi_path)
+        self.wsi = OpenSlide(wsi_path)
         self.level_count = self.wsi.level_count
         self.level_dimensions = self.wsi.level_dimensions
         self.level_downsamples = self.wsi.level_downsamples
@@ -107,11 +107,34 @@ def navigator_node(state: PathologyState) -> PathologyState:
     """导航节点：全局扫描识别 ROI"""
     print(f"🔍 [Navigator] 扫描 WSI: {state['wsi_path']}")
 
-    # 模拟低倍率扫描逻辑
+    # 初始化 WSI 读取器
+    mapper = WSICoordinateMapper(state['wsi_path'])
+
+    # 获取低倍率缩略图
+    thumbnail = mapper.get_thumbnail(target_size=(2048, 2048))
+
+    # TODO: 这里接入你的 ROI 检测模型（如 Faster R-CNN, YOLO 等）
+    # detected_boxes = roi_detector.predict(thumbnail)
+
+    # 模拟检测结果（实际应该是模型输出）
     detected_rois = [
-        {"coord": (1024, 2048), "mag": 5.0, "confidence": 0.92, "status": "pending"},
-        {"coord": (3072, 1536), "mag": 5.0, "confidence": 0.87, "status": "pending"}
+        {
+            "coord": (5000, 8000),  # level 0 坐标
+            "mag": 20.0,
+            "confidence": 0.92,
+            "status": "pending",
+            "bbox": [4800, 7800, 5200, 8200]  # 边界框 [x1, y1, x2, y2]
+        },
+        {
+            "coord": (12000, 6000),
+            "mag": 20.0,
+            "confidence": 0.87,
+            "status": "pending",
+            "bbox": [11800, 5800, 12200, 6200]
+        }
     ]
+
+    mapper.close()
 
     return {
         "roi_queue": detected_rois,
@@ -247,7 +270,7 @@ def report_generator_node(state: PathologyState) -> PathologyState:
 诊断结论:
   - 肿瘤亚型: {state['diagnostics'].get('subtype', 'N/A')}
   - 浸润深度: {state['diagnostics'].get('invasion_depth', 'N/A')}
-
+  
 形态学观察:
 {state['observations'][-1]['description'] if state['observations'] else '无'}
 
@@ -303,7 +326,7 @@ def build_pathology_graph():
         "reflector",
         should_continue_reflection,
         {
-            "sampler": "sampler",  # 反思失败 -> 重采样
+            "sampler": "sampler",      # 反思失败 -> 重采样
             "specialist": "specialist"  # 反思通过 -> 诊断
         }
     )
@@ -313,7 +336,7 @@ def build_pathology_graph():
         should_iterate,
         {
             "navigator": "navigator",  # 继续处理下一个 ROI
-            "report": "report"  # 生成报告
+            "report": "report"         # 生成报告
         }
     )
 
@@ -351,6 +374,6 @@ if __name__ == "__main__":
     config = {"configurable": {"thread_id": "pathology_001"}}
     final_state = graph.invoke(initial_state, config)
 
-    print("\n" + "=" * 50)
+    print("\n" + "="*50)
     print(final_state["final_report"])
-    print("=" * 50)
+    print("="*50)
