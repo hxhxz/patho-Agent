@@ -22,25 +22,83 @@ class PathologyState(TypedDict):
     final_report: str  # 病理报告
 
 
-# ============= 2. 坐标转换工具类 =============
-class WSICoordinateMapper:
-    """处理多尺度坐标映射"""
+# ============= 2. WSI 库集成 =============
+import openslide
+from openslide import OpenSlide
+import numpy as np
+from PIL import Image
 
-    def __init__(self, wsi_dimensions: tuple):
-        self.base_width, self.base_height = wsi_dimensions
+class WSICoordinateMapper:
+    """处理多尺度坐标映射 + WSI 实际读取"""
+
+    def __init__(self, wsi_path: str):
+        self.wsi = openslide.OpenSlide(wsi_path)
+        self.level_count = self.wsi.level_count
+        self.level_dimensions = self.wsi.level_dimensions
+        self.level_downsamples = self.wsi.level_downsamples
+
+        # 获取物理倍率（MPP - microns per pixel）
+        try:
+            self.mpp_x = float(self.wsi.properties.get(openslide.PROPERTY_NAME_MPP_X, 0.25))
+            self.mpp_y = float(self.wsi.properties.get(openslide.PROPERTY_NAME_MPP_Y, 0.25))
+        except:
+            self.mpp_x = self.mpp_y = 0.25  # 默认值
+
+    def get_best_level_for_mag(self, target_mag: float) -> int:
+        """根据目标倍率选择最佳 level"""
+        # 假设 level 0 是 40x 或通过 objective-power 属性获取
+        base_mag = float(self.wsi.properties.get(openslide.PROPERTY_NAME_OBJECTIVE_POWER, 40))
+        target_downsample = base_mag / target_mag
+
+        # 找到最接近的 level
+        best_level = 0
+        min_diff = float('inf')
+        for i, ds in enumerate(self.level_downsamples):
+            diff = abs(ds - target_downsample)
+            if diff < min_diff:
+                min_diff = diff
+                best_level = i
+        return best_level
 
     def low_to_high_mag(self, x: int, y: int,
-                        from_mag: float, to_mag: float) -> tuple:
-        """低倍率坐标 -> 高倍率坐标"""
-        scale_factor = to_mag / from_mag
-        return int(x * scale_factor), int(y * scale_factor)
+                        from_level: int, to_level: int) -> tuple:
+        """不同 level 间的坐标转换"""
+        scale = self.level_downsamples[from_level] / self.level_downsamples[to_level]
+        return int(x * scale), int(y * scale)
 
-    def extract_roi_patch(self, wsi_handle, center_x: int, center_y: int,
-                          mag: float, patch_size: int = 512):
+    def extract_roi_patch(self, center_x: int, center_y: int,
+                          mag: float, patch_size: int = 512) -> np.ndarray:
         """从 WSI 提取指定倍率的 ROI patch"""
-        # 这里预留 OpenSlide 或其他 WSI 库的接口
-        # patch = wsi_handle.read_region((center_x, center_y), level, (patch_size, patch_size))
-        return f"patch_mag{mag}_{center_x}_{center_y}.png"
+        level = self.get_best_level_for_mag(mag)
+
+        # 将中心坐标转换为 level 0 坐标（OpenSlide 要求）
+        level0_x, level0_y = center_x, center_y
+
+        # 计算左上角坐标（patch 以中心为准）
+        half_size = patch_size // 2
+        downsample = self.level_downsamples[level]
+        top_left_x = int(level0_x - half_size * downsample)
+        top_left_y = int(level0_y - half_size * downsample)
+
+        # 读取区域
+        region = self.wsi.read_region(
+            (top_left_x, top_left_y),
+            level,
+            (patch_size, patch_size)
+        )
+
+        # 转换为 RGB（OpenSlide 返回 RGBA）
+        region_rgb = region.convert('RGB')
+        return np.array(region_rgb)
+
+    def get_thumbnail(self, target_size: tuple = (1024, 1024)) -> np.ndarray:
+        """获取全局缩略图用于导航"""
+        thumbnail = self.wsi.get_thumbnail(target_size)
+        return np.array(thumbnail)
+
+    def close(self):
+        """释放 WSI 文件句柄"""
+        self.wsi.close()
 
 
 # ============= 3. 节点函数定义 =============
