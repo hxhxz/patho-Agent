@@ -3,23 +3,24 @@
 核心图编排逻辑 - Plan-Execute-Reflect 范式
 """
 
-from typing import TypedDict, List, Dict, Annotated, Literal
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
 import operator
+from typing import TypedDict, List, Dict, Annotated, Literal
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import StateGraph, END
 
 
 # ============= 1. 全局状态定义 =============
 class PathologyState(TypedDict):
     """全局状态 Schema"""
-    wsi_path: str                          # WSI 切片路径
+    wsi_path: str  # WSI 切片路径
     roi_queue: Annotated[List[Dict], operator.add]  # ROI 队列 [{coord, mag, status}]
     observations: Annotated[List[Dict], operator.add]  # MLLM 形态学描述
     reflection_log: Annotated[List[str], operator.add]  # 反思日志
-    diagnostics: Dict                       # 下游模型结果 {subtype, invasion_depth}
-    current_iteration: int                  # 当前迭代次数
-    max_iterations: int                     # 最大迭代限制
-    final_report: str                       # 病理报告
+    diagnostics: Dict  # 下游模型结果 {subtype, invasion_depth}
+    current_iteration: int  # 当前迭代次数
+    max_iterations: int  # 最大迭代限制
+    final_report: str  # 病理报告
 
 
 # ============= 2. WSI 库集成 =============
@@ -27,6 +28,7 @@ import openslide
 from openslide import OpenSlide
 import numpy as np
 from PIL import Image
+
 
 class WSICoordinateMapper:
     """处理多尺度坐标映射 + WSI 实际读取"""
@@ -107,39 +109,46 @@ def navigator_node(state: PathologyState) -> PathologyState:
     """导航节点：全局扫描识别 ROI"""
     print(f"🔍 [Navigator] 扫描 WSI: {state['wsi_path']}")
 
-    # 初始化 WSI 读取器
-    mapper = WSICoordinateMapper(state['wsi_path'])
+    # 只在第一次迭代时扫描，后续迭代只处理队列中的 ROI
+    if state.get("current_iteration", 0) == 0:
+        # 初始化 WSI 读取器
+        mapper = WSICoordinateMapper(state['wsi_path'])
 
-    # 获取低倍率缩略图
-    thumbnail = mapper.get_thumbnail(target_size=(2048, 2048))
+        # 获取低倍率缩略图
+        thumbnail = mapper.get_thumbnail(target_size=(2048, 2048))
 
-    # TODO: 这里接入你的 ROI 检测模型（如 Faster R-CNN, YOLO 等）
-    # detected_boxes = roi_detector.predict(thumbnail)
+        # TODO: 这里接入你的 ROI 检测模型（如 Faster R-CNN, YOLO 等）
+        # detected_boxes = roi_detector.predict(thumbnail)
 
-    # 模拟检测结果（实际应该是模型输出）
-    detected_rois = [
-        {
-            "coord": (5000, 8000),  # level 0 坐标
-            "mag": 20.0,
-            "confidence": 0.92,
-            "status": "pending",
-            "bbox": [4800, 7800, 5200, 8200]  # 边界框 [x1, y1, x2, y2]
-        },
-        {
-            "coord": (12000, 6000),
-            "mag": 20.0,
-            "confidence": 0.87,
-            "status": "pending",
-            "bbox": [11800, 5800, 12200, 6200]
+        # 模拟检测结果（实际应该是模型输出）
+        detected_rois = [
+            {
+                "coord": (5000, 8000),  # level 0 坐标
+                "mag": 20.0,
+                "confidence": 0.92,
+                "status": "pending",
+                "bbox": [4800, 7800, 5200, 8200]  # 边界框 [x1, y1, x2, y2]
+            },
+            {
+                "coord": (12000, 6000),
+                "mag": 20.0,
+                "confidence": 0.87,
+                "status": "pending",
+                "bbox": [11800, 5800, 12200, 6200]
+            }
+        ]
+
+        mapper.close()
+
+        return {
+            "roi_queue": detected_rois,
+            "current_iteration": 1
         }
-    ]
-
-    mapper.close()
-
-    return {
-        "roi_queue": detected_rois,
-        "current_iteration": state.get("current_iteration", 0) + 1
-    }
+    else:
+        # 后续迭代只增加计数
+        return {
+            "current_iteration": state.get("current_iteration", 0) + 1
+        }
 
 
 def sampler_node(state: PathologyState) -> PathologyState:
@@ -272,7 +281,17 @@ def specialist_node(state: PathologyState) -> PathologyState:
         "confidence": 0.89
     }
 
-    return {"diagnostics": diagnostics}
+    # 标记当前 ROI 已完成诊断
+    updated_queue = state["roi_queue"].copy()
+    for r in updated_queue:
+        if r["status"] == "sampled":
+            r["status"] = "diagnosed"
+            break
+
+    return {
+        "diagnostics": diagnostics,
+        "roi_queue": updated_queue
+    }
 
 
 def report_generator_node(state: PathologyState) -> PathologyState:
@@ -298,23 +317,44 @@ def report_generator_node(state: PathologyState) -> PathologyState:
 
 # ============= 4. 路由逻辑 =============
 
+def should_process_roi(state: PathologyState) -> Literal["sampler", "report"]:
+    """Navigator 后检查是否有待处理的 ROI"""
+    pending = [r for r in state["roi_queue"] if r["status"] == "pending"]
+
+    if pending:
+        print(f"📋 发现 {len(pending)} 个待处理 ROI，进入采样")
+        return "sampler"
+    else:
+        print("✅ 队列已空，直接生成报告")
+        return "report"
+
+
 def should_continue_reflection(state: PathologyState) -> Literal["sampler", "specialist"]:
     """反思后的路由决策"""
     if state["reflection_log"] and "不完整" in state["reflection_log"][-1]:
+        print("⚠️ 描述质量不足，重新采样")
         return "sampler"  # 重新采样
+    print("✓ 描述合格，进入诊断")
     return "specialist"  # 进入诊断
 
 
 def should_iterate(state: PathologyState) -> Literal["navigator", "report"]:
     """是否继续迭代"""
+    # 检查 1: 是否超过最大迭代次数
     if state["current_iteration"] >= state.get("max_iterations", 3):
+        print("⚠️ 达到最大迭代次数，生成报告")
         return "report"
 
-    pending = [r for r in state["roi_queue"] if r["status"] == "pending"]
-    if pending:
-        return "navigator"
+    # 检查 2: 是否还有未处理的 ROI（只看 pending，不看 diagnosed）
+    pending = [r for r in state["roi_queue"]
+               if r["status"] == "pending"]
 
-    return "report"
+    if not pending:
+        print("✅ 所有 ROI 已处理完成，生成报告")
+        return "report"
+
+    print(f"🔄 还有 {len(pending)} 个 ROI 待处理，继续迭代")
+    return "navigator"
 
 
 # ============= 5. 构建图结构 =============
@@ -332,26 +372,36 @@ def build_pathology_graph():
     workflow.add_node("report", report_generator_node)
 
     # 定义边
-    workflow.add_edge("navigator", "sampler")
+    # Navigator 后先检查队列
+    workflow.add_conditional_edges(
+        "navigator",
+        should_process_roi,
+        {
+            "sampler": "sampler",  # 有待处理 ROI
+            "report": "report"  # 队列已空
+        }
+    )
+
     workflow.add_edge("sampler", "describer")
     workflow.add_edge("describer", "reflector")
 
-    # 条件边
+    # 反思后的条件边
     workflow.add_conditional_edges(
         "reflector",
         should_continue_reflection,
         {
-            "sampler": "sampler",      # 反思失败 -> 重采样
+            "sampler": "sampler",  # 反思失败 -> 重采样
             "specialist": "specialist"  # 反思通过 -> 诊断
         }
     )
 
+    # Specialist 后检查是否继续迭代
     workflow.add_conditional_edges(
         "specialist",
         should_iterate,
         {
             "navigator": "navigator",  # 继续处理下一个 ROI
-            "report": "report"         # 生成报告
+            "report": "report"  # 生成报告
         }
     )
 
@@ -389,6 +439,6 @@ if __name__ == "__main__":
     config = {"configurable": {"thread_id": "pathology_001"}}
     final_state = graph.invoke(initial_state, config)
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print(final_state["final_report"])
-    print("="*50)
+    print("=" * 50)
