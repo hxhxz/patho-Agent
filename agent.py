@@ -12,14 +12,14 @@ import operator
 # ============= 1. 全局状态定义 =============
 class PathologyState(TypedDict):
     """全局状态 Schema"""
-    wsi_path: str  # WSI 切片路径
+    wsi_path: str                          # WSI 切片路径
     roi_queue: Annotated[List[Dict], operator.add]  # ROI 队列 [{coord, mag, status}]
     observations: Annotated[List[Dict], operator.add]  # MLLM 形态学描述
     reflection_log: Annotated[List[str], operator.add]  # 反思日志
-    diagnostics: Dict  # 下游模型结果 {subtype, invasion_depth}
-    current_iteration: int  # 当前迭代次数
-    max_iterations: int  # 最大迭代限制
-    final_report: str  # 病理报告
+    diagnostics: Dict                       # 下游模型结果 {subtype, invasion_depth}
+    current_iteration: int                  # 当前迭代次数
+    max_iterations: int                     # 最大迭代限制
+    final_report: str                       # 病理报告
 
 
 # ============= 2. WSI 库集成 =============
@@ -153,23 +153,29 @@ def sampler_node(state: PathologyState) -> PathologyState:
 
     # 取队首 ROI 进行高倍率采样
     roi = pending_rois[0]
-    mapper = WSICoordinateMapper((10000, 10000))
+    mapper = WSICoordinateMapper(state['wsi_path'])
 
-    # 转换到 20x 倍率
-    high_x, high_y = mapper.low_to_high_mag(
-        roi["coord"][0], roi["coord"][1],
-        from_mag=5.0, to_mag=20.0
+    # 提取高倍率 patch
+    patch_array = mapper.extract_roi_patch(
+        center_x=roi["coord"][0],
+        center_y=roi["coord"][1],
+        mag=roi["mag"],
+        patch_size=512
     )
 
-    # 模拟采样
-    patch_path = mapper.extract_roi_patch(None, high_x, high_y, mag=20.0)
+    # 保存 patch（可选，也可以直接传递 numpy array）
+    patch_filename = f"temp_patch_{roi['coord'][0]}_{roi['coord'][1]}.png"
+    Image.fromarray(patch_array).save(patch_filename)
+
+    mapper.close()
 
     # 更新 ROI 状态
     updated_queue = state["roi_queue"].copy()
     for r in updated_queue:
         if r["coord"] == roi["coord"]:
             r["status"] = "sampled"
-            r["patch_path"] = patch_path
+            r["patch_path"] = patch_filename
+            r["patch_array"] = patch_array  # 直接存储 numpy array
             break
 
     return {"roi_queue": updated_queue}
@@ -223,9 +229,18 @@ def reflector_node(state: PathologyState) -> PathologyState:
 
     if missing_fields:
         feedback = f"描述不完整，缺失: {', '.join(missing_fields)}"
+
+        # 获取上一个采样的 ROI 坐标，用更高倍率重新采样
+        last_roi = [r for r in state["roi_queue"] if r["status"] == "sampled"][-1]
+
         return {
             "reflection_log": [feedback],
-            "roi_queue": [{"coord": (0, 0), "mag": 40.0, "status": "pending"}]  # 触发重采样
+            "roi_queue": [{
+                "coord": last_roi["coord"],  # 使用相同位置
+                "mag": 40.0,  # 提升到 40x
+                "status": "pending",
+                "reason": "re_sample_for_detail"
+            }]
         }
 
     return {"reflection_log": ["✓ 描述合格"]}
@@ -357,7 +372,7 @@ def build_pathology_graph():
 if __name__ == "__main__":
     # 初始化状态
     initial_state = {
-        "wsi_path": "/data/slides/008682e22a74ac4a85b3b3628ef3b775.svs",
+        "wsi_path": "./data/slide/008682e22a74ac4a85b3b3628ef3b775.svs",
         "roi_queue": [],
         "observations": [],
         "reflection_log": [],
