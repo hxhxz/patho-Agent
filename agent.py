@@ -1,407 +1,397 @@
 """
-基于 LangGraph 的层级化病理诊断 Agent
-核心图编排逻辑 - Plan-Execute-Reflect 范式
+病理诊断 Agent 执行逻辑 - 基于 LangGraph 的图编排
 """
 
-import operator
-from typing import TypedDict, List, Dict, Annotated, Literal
-
-from langgraph.checkpoint.memory import MemorySaver
+from typing import TypedDict, List, Dict, Annotated, Literal, Optional
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+import operator
+import numpy as np
+import logging
+
+# 导入模型管理模块
+from model_registry import ModelRegistry
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
 
 
 # ============= 1. 全局状态定义 =============
+
 class PathologyState(TypedDict):
     """全局状态 Schema"""
-    wsi_path: str  # WSI 切片路径
-    roi_queue: Annotated[List[Dict], operator.add]  # ROI 队列 [{coord, mag, status}]
+    wsi_path: str                                       # WSI 切片路径
+    roi_queue: Annotated[List[Dict], operator.add]     # ROI 队列
     observations: Annotated[List[Dict], operator.add]  # MLLM 形态学描述
-    reflection_log: Annotated[List[str], operator.add]  # 反思日志
-    diagnostics: Dict  # 下游模型结果 {subtype, invasion_depth}
-    current_iteration: int  # 当前迭代次数
-    max_iterations: int  # 最大迭代限制
-    final_report: str  # 病理报告
+    reflection_log: Annotated[List[str], operator.add] # 反思日志
+    diagnostics: Dict                                   # 诊断结果（来自数据库）
+    current_iteration: int                              # 当前迭代次数
+    max_iterations: int                                 # 最大迭代限制
+    final_report: str                                   # 病理报告
+    slide_id: str                                       # 切片编号
 
 
-# ============= 2. WSI 库集成 =============
+# ============= 2. WSI 工具类 =============
 import openslide
 from openslide import OpenSlide
-import numpy as np
 from PIL import Image
 
 
-class WSICoordinateMapper:
-    """处理多尺度坐标映射 + WSI 实际读取"""
+
+
+class WSIHandler:
+    """WSI 读取和坐标管理"""
 
     def __init__(self, wsi_path: str):
-        self.wsi = OpenSlide(wsi_path)
-        self.level_count = self.wsi.level_count
-        self.level_dimensions = self.wsi.level_dimensions
-        self.level_downsamples = self.wsi.level_downsamples
-
-        # 获取物理倍率（MPP - microns per pixel）
+        self.wsi_path = wsi_path
         try:
-            self.mpp_x = float(self.wsi.properties.get(openslide.PROPERTY_NAME_MPP_X, 0.25))
-            self.mpp_y = float(self.wsi.properties.get(openslide.PROPERTY_NAME_MPP_Y, 0.25))
-        except:
-            self.mpp_x = self.mpp_y = 0.25  # 默认值
+            self.wsi = OpenSlide(wsi_path)
+            self.level_count = self.wsi.level_count
+            self.level_dimensions = self.wsi.level_dimensions
+            self.level_downsamples = self.wsi.level_downsamples
+        except Exception as e:
+            logger.error(f"❌ 无法打开 WSI: {e}")
+            self.wsi = None
 
-    def get_best_level_for_mag(self, target_mag: float) -> int:
-        """根据目标倍率选择最佳 level"""
-        # 假设 level 0 是 40x 或通过 objective-power 属性获取
-        base_mag = float(self.wsi.properties.get(openslide.PROPERTY_NAME_OBJECTIVE_POWER, 40))
-        target_downsample = base_mag / target_mag
 
-        # 找到最接近的 level
-        best_level = 0
-        min_diff = float('inf')
-        for i, ds in enumerate(self.level_downsamples):
-            diff = abs(ds - target_downsample)
-            if diff < min_diff:
-                min_diff = diff
-                best_level = i
-        return best_level
+    def get_thumbnail(self, size=(2048, 2048)) -> np.ndarray:
+        """获取缩略图用于导航"""
+        if self.wsi:
+            thumbnail = self.wsi.get_thumbnail(size)
+            return np.array(thumbnail)
+        else:
+            # 模拟缩略图
+            logger.warning("⚠️ 使用模拟缩略图")
+            return np.random.randint(0, 255, (*size, 3), dtype=np.uint8)
 
-    def low_to_high_mag(self, x: int, y: int,
-                        from_level: int, to_level: int) -> tuple:
-        """不同 level 间的坐标转换"""
-        scale = self.level_downsamples[from_level] / self.level_downsamples[to_level]
-        return int(x * scale), int(y * scale)
+    def extract_patch(self,
+                     x: int,
+                     y: int,
+                     size: int = 512,
+                     level: int = 0) -> np.ndarray:
+        """
+        提取 patch
 
-    def extract_roi_patch(self, center_x: int, center_y: int,
-                          mag: float, patch_size: int = 512) -> np.ndarray:
-        """从 WSI 提取指定倍率的 ROI patch"""
-        level = self.get_best_level_for_mag(mag)
+        Args:
+            x, y: 中心坐标 (level 0)
+            size: patch 大小
+            level: 分辨率层级
+        """
+        if self.wsi:
+            try:
+                # 计算左上角坐标
+                top_left_x = x - size // 2
+                top_left_y = y - size // 2
 
-        # 将中心坐标转换为 level 0 坐标（OpenSlide 要求）
-        level0_x, level0_y = center_x, center_y
-
-        # 计算左上角坐标（patch 以中心为准）
-        half_size = patch_size // 2
-        downsample = self.level_downsamples[level]
-        top_left_x = int(level0_x - half_size * downsample)
-        top_left_y = int(level0_y - half_size * downsample)
-
-        # 读取区域
-        region = self.wsi.read_region(
-            (top_left_x, top_left_y),
-            level,
-            (patch_size, patch_size)
-        )
-
-        # 转换为 RGB（OpenSlide 返回 RGBA）
-        region_rgb = region.convert('RGB')
-        return np.array(region_rgb)
-
-    def get_thumbnail(self, target_size: tuple = (1024, 1024)) -> np.ndarray:
-        """获取全局缩略图用于导航"""
-        thumbnail = self.wsi.get_thumbnail(target_size)
-        return np.array(thumbnail)
+                region = self.wsi.read_region(
+                    (top_left_x, top_left_y),
+                    level,
+                    (size, size)
+                )
+                return np.array(region.convert('RGB'))
+            except Exception as e:
+                logger.error(f"❌ 提取 patch 失败: {e}")
+                return np.zeros((size, size, 3), dtype=np.uint8)
+        else:
+            # 模拟 patch
+            logger.warning("⚠️ 使用模拟 patch")
+            return np.random.randint(0, 255, (size, size, 3), dtype=np.uint8)
 
     def close(self):
         """释放 WSI 文件句柄"""
-        self.wsi.close()
+        if self.wsi:
+            self.wsi.close()
 
 
-# ============= 3. 节点函数定义 =============
+# ============= 3. LangGraph 节点定义 =============
 
-def navigator_node(state: PathologyState) -> PathologyState:
-    """导航节点：全局扫描识别 ROI"""
-    print(f"🔍 [Navigator] 扫描 WSI: {state['wsi_path']}")
+class PathologyAgent:
+    """病理诊断 Agent 主类"""
 
-    # 只在第一次迭代时扫描，后续迭代只处理队列中的 ROI
-    if state.get("current_iteration", 0) == 0:
-        # 初始化 WSI 读取器
-        mapper = WSICoordinateMapper(state['wsi_path'])
+    def __init__(self, model_registry: ModelRegistry):
+        self.models = model_registry
 
-        # 获取低倍率缩略图
-        thumbnail = mapper.get_thumbnail(target_size=(2048, 2048))
+    # ----------- 节点 1: Navigator -----------
+    def navigator_node(self, state: PathologyState) -> PathologyState:
+        """导航节点：ROI 检测"""
+        logger.info(f"\n{'='*70}")
+        logger.info(f"🔍 [Navigator] 第 {state.get('current_iteration', 0) + 1} 轮导航")
+        logger.info(f"{'='*70}")
 
-        # TODO: 这里接入你的 ROI 检测模型（如 Faster R-CNN, YOLO 等）
-        # detected_boxes = roi_detector.predict(thumbnail)
+        # 只在第一次迭代执行检测
+        if state.get("current_iteration", 0) == 0:
+            wsi = WSIHandler(state['wsi_path'])
+            thumbnail = wsi.get_thumbnail()
 
-        # 模拟检测结果（实际应该是模型输出）
-        detected_rois = [
-            {
-                "coord": (5000, 8000),  # level 0 坐标
-                "mag": 20.0,
-                "confidence": 0.92,
-                "status": "pending",
-                "bbox": [4800, 7800, 5200, 8200]  # 边界框 [x1, y1, x2, y2]
-            },
-            {
-                "coord": (12000, 6000),
-                "mag": 20.0,
-                "confidence": 0.87,
-                "status": "pending",
-                "bbox": [11800, 5800, 12200, 6200]
+            # 调用统一 API：感知导航器 (Gemini 3 Pro)
+            rois = self.models.detect_rois(thumbnail)
+
+            # 转换为标准格式
+            roi_queue = [
+                {
+                    "coord": (roi["center_x"], roi["center_y"]),
+                    "bbox": roi["bbox"],
+                    "mag": 20.0,
+                    "confidence": roi["confidence"],
+                    "status": "pending",
+                    "roi_type": roi["class"]
+                }
+                for roi in rois
+            ]
+
+            wsi.close()
+
+            logger.info(f"✅ 检测到 {len(roi_queue)} 个候选 ROI")
+
+            return {
+                "roi_queue": roi_queue,
+                "current_iteration": 1
             }
-        ]
+        else:
+            # 后续迭代只增加计数
+            return {"current_iteration": state.get("current_iteration", 0) + 1}
 
-        mapper.close()
+    # ----------- 节点 2: Sampler -----------
+    def sampler_node(self, state: PathologyState) -> PathologyState:
+        """采样节点：提取高倍率 Patch"""
+        logger.info(f"\n📸 [Sampler] 采样高倍率 Patch...")
 
-        return {
-            "roi_queue": detected_rois,
-            "current_iteration": 1
-        }
-    else:
-        # 后续迭代只增加计数
-        return {
-            "current_iteration": state.get("current_iteration", 0) + 1
-        }
+        pending = [r for r in state["roi_queue"] if r["status"] == "pending"]
+        if not pending:
+            logger.warning("⚠️ 队列中无待处理 ROI")
+            return {}
 
+        roi = pending[0]
+        logger.info(f"   处理 ROI: {roi['coord']} (类型: {roi.get('roi_type', 'unknown')})")
 
-def sampler_node(state: PathologyState) -> PathologyState:
-    """采样节点：多尺度截图采样"""
-    print(f"📸 [Sampler] 处理 ROI 队列...")
+        wsi = WSIHandler(state['wsi_path'])
 
-    pending_rois = [r for r in state["roi_queue"] if r["status"] == "pending"]
+        # 提取 patch
+        patch = wsi.extract_patch(roi["coord"][0], roi["coord"][1], size=512)
 
-    if not pending_rois:
-        return {}
+        wsi.close()
 
-    # 取队首 ROI 进行高倍率采样
-    roi = pending_rois[0]
-    mapper = WSICoordinateMapper(state['wsi_path'])
+        # 更新状态
+        updated_queue = state["roi_queue"].copy()
+        for r in updated_queue:
+            if r["coord"] == roi["coord"] and r["status"] == "pending":
+                r["status"] = "sampled"
+                r["patch"] = patch
+                break
 
-    # 提取高倍率 patch
-    patch_array = mapper.extract_roi_patch(
-        center_x=roi["coord"][0],
-        center_y=roi["coord"][1],
-        mag=roi["mag"],
-        patch_size=512
-    )
+        return {"roi_queue": updated_queue}
 
-    # 保存 patch（可选，也可以直接传递 numpy array）
-    patch_filename = f"temp_patch_{roi['coord'][0]}_{roi['coord'][1]}.png"
-    Image.fromarray(patch_array).save(patch_filename)
+    # ----------- 节点 3: Describer -----------
+    def describer_node(self, state: PathologyState) -> PathologyState:
+        """描述节点：MLLM 形态学分析"""
+        logger.info(f"\n🔬 [Describer] 生成形态学描述...")
 
-    mapper.close()
+        sampled = [r for r in state["roi_queue"] if r["status"] == "sampled"]
+        if not sampled:
+            logger.warning("⚠️ 无已采样的 ROI")
+            return {}
 
-    # 更新 ROI 状态
-    updated_queue = state["roi_queue"].copy()
-    for r in updated_queue:
-        if r["coord"] == roi["coord"]:
-            r["status"] = "sampled"
-            r["patch_path"] = patch_filename
-            r["patch_array"] = patch_array  # 直接存储 numpy array
-            break
+        roi = sampled[-1]  # 取最新采样的
+        patch = roi.get("patch")
 
-    return {"roi_queue": updated_queue}
+        # 调用统一 API：语义解析员 (Gemini 3 Pro)
+        description = self.models.describe_patch(patch)
 
-
-def describer_node(state: PathologyState) -> PathologyState:
-    """MLLM 描述节点：提取形态学特征"""
-    print(f"🔬 [Describer] 调用 MLLM 分析形态学...")
-
-    # 构造结构化 Prompt
-    prompt = """
-    你是资深病理专科医生。请分析该病理切片，必须包含：
-    1. [细胞特征]：核浆比、核分裂象
-    2. [组织结构]：腺体排列、坏死情况
-    3. [间质改变]：纤维化、炎性浸润
-    4. [基底膜]：连续性、破坏程度
-    """
-
-    # 模拟 MLLM 响应
-    observation = {
-        "patch_id": "roi_0_mag20",
-        "description": {
-            "细胞特征": "核浆比增高(>1:2)，核分裂象 3-5/HPF",
-            "组织结构": "腺体融合，背靠背排列，局部坏死",
-            "间质改变": "间质纤维化伴淋巴细胞浸润",
-            "基底膜": "基底膜局部中断"
-        },
-        "completeness_score": 0.95
-    }
-
-    return {"observations": [observation]}
-
-
-def reflector_node(state: PathologyState) -> PathologyState:
-    """反思节点：质量检查与反馈"""
-    print(f"🤔 [Reflector] 审查描述质量...")
-
-    if not state["observations"]:
-        return {"reflection_log": ["ERROR: 无有效观察结果"]}
-
-    latest_obs = state["observations"][-1]
-    desc = latest_obs["description"]
-
-    # 反思规则
-    missing_fields = []
-    required_fields = ["细胞特征", "组织结构", "间质改变", "基底膜"]
-
-    for field in required_fields:
-        if field not in desc or len(desc[field]) < 10:
-            missing_fields.append(field)
-
-    if missing_fields:
-        feedback = f"描述不完整，缺失: {', '.join(missing_fields)}"
-
-        # 获取上一个采样的 ROI 坐标，用更高倍率重新采样
-        last_roi = [r for r in state["roi_queue"] if r["status"] == "sampled"][-1]
-
-        return {
-            "reflection_log": [feedback],
-            "roi_queue": [{
-                "coord": last_roi["coord"],  # 使用相同位置
-                "mag": 40.0,  # 提升到 40x
-                "status": "pending",
-                "reason": "re_sample_for_detail"
-            }]
+        observation = {
+            "roi_coord": roi["coord"],
+            "roi_type": roi.get("roi_type"),
+            "description": description,
+            "timestamp": state.get("current_iteration")
         }
 
-    return {"reflection_log": ["✓ 描述合格"]}
+        logger.info(f"   完整度评分: {description.get('completeness_score', 0):.2f}")
 
+        return {"observations": [observation]}
 
-def specialist_node(state: PathologyState) -> PathologyState:
-    """专家诊断节点：NPU 加速模型推理"""
-    print(f"🧠 [Specialist] 调用下游专家模型...")
+    # ----------- 节点 4: Reflector -----------
+    def reflector_node(self, state: PathologyState) -> PathologyState:
+        """反思节点：质量检查"""
+        logger.info(f"\n🤔 [Reflector] 审查描述质量...")
 
-    # 模拟 NPU 推理调用
-    def call_npu_model(model_name: str, input_data: dict):
-        """预留 NPU 推理接口"""
-        # 实际调用: npu_engine.infer(model_name, input_data)
-        return {"result": f"{model_name}_output"}
+        if not state["observations"]:
+            return {"reflection_log": ["ERROR: 无观察结果"]}
 
-    # 亚型分类
-    subtype_result = call_npu_model("subtype_classifier", {
-        "patch": state["observations"][-1]["patch_id"]
-    })
+        latest_obs = state["observations"][-1]
 
-    # 浸润深度评估
-    invasion_result = call_npu_model("invasion_depth_model", {
-        "features": state["observations"][-1]["description"]
-    })
+        # 调用统一 API：审核审查员 (Baichuan)
+        reflection = self.models.reflect_quality(
+            latest_obs["description"],
+            diagnostic_goal="subtype+invasion"
+        )
 
-    diagnostics = {
-        "subtype": "moderately_differentiated_adenocarcinoma",
-        "invasion_depth": "muscularis_propria",
-        "confidence": 0.89
-    }
+        logger.info(f"   质量评分: {reflection.get('quality_score', 0):.2f}")
+        logger.info(f"   决策: {reflection.get('action', 'UNKNOWN')}")
 
-    # 标记当前 ROI 已完成诊断
-    updated_queue = state["roi_queue"].copy()
-    for r in updated_queue:
-        if r["status"] == "sampled":
-            r["status"] = "diagnosed"
-            break
+        if reflection.get("action") == "RE-SCAN":
+            # 触发重采样
+            last_roi_coord = latest_obs["roi_coord"]
 
-    return {
-        "diagnostics": diagnostics,
-        "roi_queue": updated_queue
-    }
+            logger.warning(f"   ⚠️ {reflection.get('suggestions', '')}")
 
+            return {
+                "reflection_log": [f"⚠️ {reflection.get('suggestions', '')}"],
+                "roi_queue": [{
+                    "coord": last_roi_coord,
+                    "mag": 40.0,
+                    "status": "pending",
+                    "reason": "reflection_rescan"
+                }]
+            }
 
-def report_generator_node(state: PathologyState) -> PathologyState:
-    """报告生成节点"""
-    print(f"📄 [Reporter] 生成病理报告...")
+        return {"reflection_log": [f"✓ {reflection.get('suggestions', '')}"]}
 
-    report = f"""
-=== 病理诊断报告 ===
-切片编号: {state['wsi_path']}
-诊断结论:
-  - 肿瘤亚型: {state['diagnostics'].get('subtype', 'N/A')}
-  - 浸润深度: {state['diagnostics'].get('invasion_depth', 'N/A')}
-  
-形态学观察:
-{state['observations'][-1]['description'] if state['observations'] else '无'}
+    # ----------- 节点 5: Diagnosis Query (替代 PFM + Specialist) -----------
+    def diagnosis_query_node(self, state: PathologyState) -> PathologyState:
+        """诊断查询节点：从离线数据库获取诊断结果"""
+        logger.info(f"\n🗄️ [DiagnosisDB] 查询离线诊断结果...")
 
-质控日志:
-{chr(10).join(state['reflection_log'])}
-    """
+        if not state["observations"]:
+            logger.warning("⚠️ 无观察结果")
+            return {}
 
-    return {"final_report": report.strip()}
+        latest_obs = state["observations"][-1]
+        roi_coord = latest_obs["roi_coord"]
+
+        # 调用数据库查询
+        diagnosis_result = self.models.query_diagnosis(
+            slide_id=state["slide_id"],
+            roi_coord=roi_coord
+        )
+
+        diagnostics = {
+            "subtype": diagnosis_result["subtype"],
+            "subtype_confidence": diagnosis_result["subtype_confidence"],
+            "invasion_layer": diagnosis_result["invasion_layer"],
+            "depth_mm": diagnosis_result["depth_mm"],
+            "invasion_confidence": diagnosis_result["invasion_confidence"],
+            "model_version": diagnosis_result.get("model_version", "unknown")
+        }
+
+        logger.info(f"   📌 模型版本: {diagnostics['model_version']}")
+
+        # 标记当前 ROI 完成
+        updated_queue = state["roi_queue"].copy()
+        for r in updated_queue:
+            if r["status"] == "sampled":
+                r["status"] = "diagnosed"
+                break
+
+        return {
+            "diagnostics": diagnostics,
+            "roi_queue": updated_queue
+        }
+
+    # ----------- 节点 6: Report Generator -----------
+    def report_generator_node(self, state: PathologyState) -> PathologyState:
+        """报告生成节点"""
+        logger.info(f"\n📄 [Report Generator] 生成最终报告...")
+
+        # 调用统一 API：报告生成器 (Baichuan)
+        report = self.models.generate_report(
+            state["observations"],
+            state["diagnostics"],
+            slide_id=state.get("slide_id", "UNKNOWN")
+        )
+
+        logger.info("   ✅ 报告生成完成")
+
+        return {"final_report": report}
 
 
 # ============= 4. 路由逻辑 =============
 
 def should_process_roi(state: PathologyState) -> Literal["sampler", "report"]:
-    """Navigator 后检查是否有待处理的 ROI"""
+    """Navigator 后的路由"""
     pending = [r for r in state["roi_queue"] if r["status"] == "pending"]
 
     if pending:
-        print(f"📋 发现 {len(pending)} 个待处理 ROI，进入采样")
+        logger.info(f"📋 发现 {len(pending)} 个待处理 ROI，进入采样")
         return "sampler"
     else:
-        print("✅ 队列已空，直接生成报告")
+        logger.info("✅ 队列已空，直接生成报告")
         return "report"
 
 
-def should_continue_reflection(state: PathologyState) -> Literal["sampler", "specialist"]:
-    """反思后的路由决策"""
-    if state["reflection_log"] and "不完整" in state["reflection_log"][-1]:
-        print("⚠️ 描述质量不足，重新采样")
-        return "sampler"  # 重新采样
-    print("✓ 描述合格，进入诊断")
-    return "specialist"  # 进入诊断
+def should_continue_reflection(state: PathologyState) -> Literal["sampler", "diagnosis_query"]:
+    """Reflector 后的路由"""
+    if state["reflection_log"] and "⚠️" in state["reflection_log"][-1]:
+        logger.info("⚠️ 描述质量不足，重新采样")
+        return "sampler"
+
+    logger.info("✓ 描述合格，查询诊断数据库")
+    return "diagnosis_query"
 
 
 def should_iterate(state: PathologyState) -> Literal["navigator", "report"]:
-    """是否继续迭代"""
+    """Specialist 后的路由"""
     # 检查 1: 是否超过最大迭代次数
     if state["current_iteration"] >= state.get("max_iterations", 3):
-        print("⚠️ 达到最大迭代次数，生成报告")
+        logger.info("⚠️ 达到最大迭代次数，生成报告")
         return "report"
 
-    # 检查 2: 是否还有未处理的 ROI（只看 pending，不看 diagnosed）
-    pending = [r for r in state["roi_queue"]
-               if r["status"] == "pending"]
+    # 检查 2: 是否还有未处理的 ROI
+    pending = [r for r in state["roi_queue"] if r["status"] == "pending"]
 
     if not pending:
-        print("✅ 所有 ROI 已处理完成，生成报告")
+        logger.info("✅ 所有 ROI 已处理完成，生成报告")
         return "report"
 
-    print(f"🔄 还有 {len(pending)} 个 ROI 待处理，继续迭代")
+    logger.info(f"🔄 还有 {len(pending)} 个 ROI 待处理，继续迭代")
     return "navigator"
 
 
-# ============= 5. 构建图结构 =============
+# ============= 5. 构建图 =============
 
-def build_pathology_graph():
+def build_pathology_graph(model_registry: ModelRegistry) -> StateGraph:
     """构建完整的诊断图"""
+
+    # 创建 Agent 实例
+    agent = PathologyAgent(model_registry)
+
+    # 构建图
     workflow = StateGraph(PathologyState)
 
     # 添加节点
-    workflow.add_node("navigator", navigator_node)
-    workflow.add_node("sampler", sampler_node)
-    workflow.add_node("describer", describer_node)
-    workflow.add_node("reflector", reflector_node)
-    workflow.add_node("specialist", specialist_node)
-    workflow.add_node("report", report_generator_node)
+    workflow.add_node("navigator", agent.navigator_node)
+    workflow.add_node("sampler", agent.sampler_node)
+    workflow.add_node("describer", agent.describer_node)
+    workflow.add_node("reflector", agent.reflector_node)
+    workflow.add_node("diagnosis_query", agent.diagnosis_query_node)  # 替代 pfm_extraction + specialist
+    workflow.add_node("report", agent.report_generator_node)
 
     # 定义边
-    # Navigator 后先检查队列
     workflow.add_conditional_edges(
         "navigator",
         should_process_roi,
         {
-            "sampler": "sampler",  # 有待处理 ROI
-            "report": "report"  # 队列已空
+            "sampler": "sampler",
+            "report": "report"
         }
     )
 
     workflow.add_edge("sampler", "describer")
     workflow.add_edge("describer", "reflector")
 
-    # 反思后的条件边
     workflow.add_conditional_edges(
         "reflector",
         should_continue_reflection,
         {
-            "sampler": "sampler",  # 反思失败 -> 重采样
-            "specialist": "specialist"  # 反思通过 -> 诊断
+            "sampler": "sampler",
+            "diagnosis_query": "diagnosis_query"  # 直接查询诊断数据库
         }
     )
 
-    # Specialist 后检查是否继续迭代
     workflow.add_conditional_edges(
-        "specialist",
+        "diagnosis_query",
         should_iterate,
         {
-            "navigator": "navigator",  # 继续处理下一个 ROI
-            "report": "report"  # 生成报告
+            "navigator": "navigator",
+            "report": "report"
         }
     )
 
@@ -412,33 +402,123 @@ def build_pathology_graph():
 
     # 编译图
     memory = MemorySaver()
-    app = workflow.compile(checkpointer=memory)
-
-    return app
+    return workflow.compile(checkpointer=memory)
 
 
-# ============= 6. 执行示例 =============
+# ============= 6. 主执行入口 =============
 
-if __name__ == "__main__":
-    # 初始化状态
+def run_pathology_diagnosis(
+    wsi_path: str,
+    slide_id: str = "SLIDE-001",
+    max_iterations: int = 2,
+    model_config: Optional[Dict] = None
+) -> Dict:
+    """
+    执行病理诊断流程
+
+    Args:
+        wsi_path: WSI 文件路径
+        slide_id: 切片编号
+        max_iterations: 最大迭代次数
+        model_config: 模型配置字典
+
+    Returns:
+        Dict: 包含最终状态的字典
+    """
+
+    # 1. 初始化模型注册中心
+    logger.info("\n" + "="*70)
+    logger.info("🚀 初始化病理诊断系统")
+    logger.info("="*70)
+
+    model_registry = ModelRegistry(config=model_config)
+    model_registry.load_all()
+
+    # 2. 构建图
+    graph = build_pathology_graph(model_registry)
+
+    # 3. 初始化状态
     initial_state = {
         "wsi_path": "./data/slide/008682e22a74ac4a85b3b3628ef3b775.svs",
+        "slide_id": "008682",
         "roi_queue": [],
         "observations": [],
         "reflection_log": [],
         "diagnostics": {},
         "current_iteration": 0,
-        "max_iterations": 2,
+        "max_iterations": max_iterations,
         "final_report": ""
     }
 
-    # 构建图
-    graph = build_pathology_graph()
+    # 4. 执行图
+    logger.info("\n" + "="*70)
+    logger.info("🏥 开始病理诊断流程")
+    logger.info("="*70)
 
-    # 执行
-    config = {"configurable": {"thread_id": "pathology_001"}}
-    final_state = graph.invoke(initial_state, config)
+    config = {"configurable": {"thread_id": f"diagnosis_{slide_id}"}}
 
-    print("\n" + "=" * 50)
-    print(final_state["final_report"])
-    print("=" * 50)
+    try:
+        final_state = graph.invoke(initial_state, config)
+
+        # 5. 输出结果
+        logger.info("\n" + "="*70)
+        logger.info("📊 诊断完成")
+        logger.info("="*70)
+        logger.info(f"\n{final_state['final_report']}\n")
+        logger.info("="*70)
+
+        return final_state
+
+    except Exception as e:
+        logger.error(f"\n❌ 诊断流程出错: {e}\n")
+        raise
+
+
+# ============= 7. 命令行接口 =============
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="病理诊断 Agent V11")
+    parser.add_argument("--wsi", type=str, required=True, help="WSI 文件路径")
+    parser.add_argument("--slide-id", type=str, default="SLIDE-001", help="切片编号")
+    parser.add_argument("--max-iter", type=int, default=2, help="最大迭代次数")
+    parser.add_argument("--gemini-key", type=str, default=None,
+                       help="Gemini API Key")
+    parser.add_argument("--baichuan-key", type=str, default=None,
+                       help="Baichuan API Key")
+    parser.add_argument("--db-type", type=str, default="sqlite",
+                       choices=["sqlite", "mongodb", "redis"],
+                       help="诊断数据库类型")
+    parser.add_argument("--db-path", type=str, default="pathology_diagnosis.db",
+                       help="数据库路径（SQLite）或主机地址")
+
+    args = parser.parse_args()
+
+    # 构建配置
+    config = {
+        "api": {
+            "gemini": {
+                "api_key": args.gemini_key,
+                "model": "gemini-3-pro-vision"
+            },
+            "baichuan": {
+                "api_key": args.baichuan_key,
+                "model": "Baichuan4",
+                "api_base": "https://api.baichuan-ai.com/v1"
+            }
+        },
+        "database": {
+            "type": args.db_type,
+            "path": args.db_path if args.db_type == "sqlite" else None,
+            "host": args.db_path if args.db_type in ["mongodb", "redis"] else None
+        }
+    }
+
+    # 执行诊断
+    run_pathology_diagnosis(
+        wsi_path=args.wsi,
+        slide_id=args.slide_id,
+        max_iterations=args.max_iter,
+        model_config=config
+    )
