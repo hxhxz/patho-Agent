@@ -11,6 +11,7 @@ import logging
 
 # 导入模型管理模块
 from model_registry import ModelRegistry
+from utils import save_rois
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
@@ -32,9 +33,7 @@ class PathologyState(TypedDict):
 
 
 # ============= 2. WSI 工具类 =============
-import openslide
 from openslide import OpenSlide
-from PIL import Image
 
 
 
@@ -53,49 +52,36 @@ class WSIHandler:
             logger.error(f"❌ 无法打开 WSI: {e}")
             self.wsi = None
 
+    def extract_roi_patch(self, center_x, center_y, patch_size) -> np.ndarray:
+        """从 WSI 提取指定倍率的 ROI patch"""
+        # 将中心坐标转换为 level 0 坐标（OpenSlide 要求）
+        thumbnail = self.wsi.get_thumbnail((2048, 2048))
+        img_array = np.array(thumbnail)
+        arr1 = img_array[:]
+        width, height, channel = arr1.shape
+        original_width, original_hight = self.level_dimensions[0]
+        top_left_x = center_x / width * original_width - patch_size // 2
+        top_left_y = center_y / width * original_hight - patch_size // 2
+
+        # 读取区域
+        region = self.wsi.read_region(
+            (int(top_left_x), int(top_left_y)),
+            0,
+            (int(patch_size), int(patch_size))
+        )
+
+        # 转换为 RGB（OpenSlide 返回 RGBA）
+        region_rgb = region.convert('RGB')
+        return np.array(region_rgb)
+
 
     def get_thumbnail(self, size=(2048, 2048)) -> np.ndarray:
         """获取缩略图用于导航"""
         if self.wsi:
             thumbnail = self.wsi.get_thumbnail(size)
+            thumbnail_rgb = thumbnail.convert("RGB")
+            thumbnail_rgb.save('./roi_region/thumbnail.png', "PNG")
             return np.array(thumbnail)
-        else:
-            # 模拟缩略图
-            logger.warning("⚠️ 使用模拟缩略图")
-            return np.random.randint(0, 255, (*size, 3), dtype=np.uint8)
-
-    def extract_patch(self,
-                     x: int,
-                     y: int,
-                     size: int = 512,
-                     level: int = 0) -> np.ndarray:
-        """
-        提取 patch
-
-        Args:
-            x, y: 中心坐标 (level 0)
-            size: patch 大小
-            level: 分辨率层级
-        """
-        if self.wsi:
-            try:
-                # 计算左上角坐标
-                top_left_x = x - size // 2
-                top_left_y = y - size // 2
-
-                region = self.wsi.read_region(
-                    (top_left_x, top_left_y),
-                    level,
-                    (size, size)
-                )
-                return np.array(region.convert('RGB'))
-            except Exception as e:
-                logger.error(f"❌ 提取 patch 失败: {e}")
-                return np.zeros((size, size, 3), dtype=np.uint8)
-        else:
-            # 模拟 patch
-            logger.warning("⚠️ 使用模拟 patch")
-            return np.random.randint(0, 255, (size, size, 3), dtype=np.uint8)
 
     def close(self):
         """释放 WSI 文件句柄"""
@@ -123,6 +109,10 @@ class PathologyAgent:
             wsi = WSIHandler(state['wsi_path'])
             thumbnail = wsi.get_thumbnail()
 
+            logger.info(f"缩略图尺寸是 {thumbnail.shape}")
+
+
+
             # 调用统一 API：感知导航器 (Gemini 3 Pro)
             rois = self.models.detect_rois(thumbnail)
 
@@ -138,6 +128,9 @@ class PathologyAgent:
                 }
                 for roi in rois
             ]
+
+            # 保存roi区域的缩略图
+            save_rois(thumbnail, rois)
 
             wsi.close()
 
@@ -167,7 +160,8 @@ class PathologyAgent:
         wsi = WSIHandler(state['wsi_path'])
 
         # 提取 patch
-        patch = wsi.extract_patch(roi["coord"][0], roi["coord"][1], size=512)
+        # todo : patches支持遍历
+        patch = wsi.extract_roi_patch(roi["coord"][0], roi["coord"][1], patch_size=672)
 
         wsi.close()
 
@@ -203,6 +197,7 @@ class PathologyAgent:
             "description": description,
             "timestamp": state.get("current_iteration")
         }
+        logger.info(f"   形态学描述: {description.get('completeness_score', 0):.2f}")
 
         logger.info(f"   完整度评分: {description.get('completeness_score', 0):.2f}")
 
@@ -221,7 +216,7 @@ class PathologyAgent:
         # 调用统一 API：审核审查员 (Baichuan)
         reflection = self.models.reflect_quality(
             latest_obs["description"],
-            diagnostic_goal="subtype+invasion"
+            goal="subtype+invasion"
         )
 
         logger.info(f"   质量评分: {reflection.get('quality_score', 0):.2f}")
@@ -480,9 +475,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="病理诊断 Agent V11")
-    parser.add_argument("--wsi", type=str, required=True, help="WSI 文件路径")
+    parser.add_argument("--wsi", type=str, required=False, help="WSI 文件路径")
     parser.add_argument("--slide-id", type=str, default="SLIDE-001", help="切片编号")
-    parser.add_argument("--max-iter", type=int, default=2, help="最大迭代次数")
+    parser.add_argument("--max-iter", type=int, default=25, help="最大迭代次数")
     parser.add_argument("--gemini-key", type=str, default=None,
                        help="Gemini API Key")
     parser.add_argument("--baichuan-key", type=str, default=None,
@@ -500,11 +495,11 @@ if __name__ == "__main__":
         "api": {
             "gemini": {
                 "api_key": args.gemini_key,
-                "model": "gemini-3-pro-vision"
+                "model": "gemini-3-pro-preview"
             },
             "baichuan": {
-                "api_key": args.baichuan_key,
-                "model": "Baichuan4",
+                "api_key": args.baichuan_ke,
+                "model": "Baichuan-M3",
                 "api_base": "https://api.baichuan-ai.com/v1"
             }
         },

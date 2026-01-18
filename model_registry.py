@@ -8,9 +8,13 @@ from typing import Dict, List, Optional, Any
 import logging
 import json
 import re
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+os.environ['HTTP_PROXY'] = 'http://127.0.0.1:56054'
+os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:56054'
 
 
 # ============= 统一 API 调用类 =============
@@ -55,12 +59,11 @@ class UnifiedModelAPI:
         # 初始化 Gemini
         if "gemini" in self.config:
             try:
-                # TODO: 取消注释以使用真实 Gemini
-                # import google.generativeai as genai
-                # genai.configure(api_key=self.config["gemini"]["api_key"])
-                # self.gemini_client = genai.GenerativeModel(
-                #     self.config["gemini"].get("model", "gemini-3-pro-vision")
-                # )
+                import google.generativeai as genai
+                genai.configure(api_key=self.config["gemini"]["api_key"])
+                self.gemini_client = genai.GenerativeModel(
+                    self.config["gemini"].get("model", "gemini-3-pro-preview")
+                )
                 logger.info("  ✅ Gemini 3 Pro 已加载")
             except Exception as e:
                 logger.error(f"  ❌ Gemini 加载失败: {e}")
@@ -69,13 +72,14 @@ class UnifiedModelAPI:
         if "baichuan" in self.config:
             try:
                 # TODO: 取消注释以使用真实 Baichuan
-                # import requests
-                # self.baichuan_session = requests.Session()
-                # self.baichuan_session.headers.update({
-                #     "Authorization": f"Bearer {self.config['baichuan']['api_key']}",
-                #     "Content-Type": "application/json"
-                # })
-                logger.info("  ✅ Baichuan 4 已加载")
+                import requests
+                import json
+                self.baichuan_session = requests.Session()
+                self.baichuan_session.headers.update({
+                    "Authorization": f"Bearer {self.config['baichuan']['api_key']}",
+                    "Content-Type": "application/json"
+                })
+                logger.info("  ✅ Baichuan 3 已加载")
             except Exception as e:
                 logger.error(f"  ❌ Baichuan 加载失败: {e}")
 
@@ -114,83 +118,83 @@ class UnifiedModelAPI:
         """调用 Gemini API"""
 
         # TODO: 实际 API 调用
-        # from PIL import Image
-        #
-        # if image is not None:
-        #     img = Image.fromarray(image)
-        #     response = self.gemini_client.generate_content([prompt, img])
-        # else:
-        #     response = self.gemini_client.generate_content(prompt)
-        #
-        # return response.text
+        from PIL import Image
+
+        if image is not None:
+            img = Image.fromarray(image)
+            response = self.gemini_client.generate_content([prompt, img])
+        else:
+            response = self.gemini_client.generate_content(prompt)
+
+        return response.text
 
         # Mock 响应
-        logger.info("  🤖 [Gemini] 模拟调用...")
-        if "ROI" in prompt or "检测" in prompt:
-            return json.dumps({
-                "rois": [
-                    {"center_x": 5000, "center_y": 8000, "bbox": [4800, 7800, 5200, 8200],
-                     "confidence": 0.92, "class": "tumor_region"},
-                    {"center_x": 12000, "center_y": 6000, "bbox": [11800, 5800, 12200, 6200],
-                     "confidence": 0.87, "class": "dysplastic_area"}
-                ]
-            })
-        elif "形态学" in prompt or "描述" in prompt:
-            return json.dumps({
-                "细胞特征": "核浆比增高(>1:2)，核分裂象 3-5/HPF，核仁明显",
-                "组织结构": "腺体融合排列，背靠背模式，局部坏死",
-                "间质改变": "间质纤维化伴淋巴细胞浸润",
-                "基底膜": "基底膜局部中断，侵犯粘膜下层",
-                "completeness_score": 0.95
-            })
-        else:
-            return "Gemini mock response"
+        # logger.info("  🤖 [Gemini] 模拟调用...")
+        # if "ROI" in prompt or "检测" in prompt:
+        #     return json.dumps({
+        #         "rois": [
+        #             {"center_x": 5000, "center_y": 8000, "bbox": [4800, 7800, 5200, 8200],
+        #              "confidence": 0.92, "class": "tumor_region"},
+        #             {"center_x": 12000, "center_y": 6000, "bbox": [11800, 5800, 12200, 6200],
+        #              "confidence": 0.87, "class": "dysplastic_area"}
+        #         ]
+        #     })
+        # elif "形态学" in prompt or "描述" in prompt:
+        #     return json.dumps({
+        #         "细胞特征": "核浆比增高(>1:2)，核分裂象 3-5/HPF，核仁明显",
+        #         "组织结构": "腺体融合排列，背靠背模式，局部坏死",
+        #         "间质改变": "间质纤维化伴淋巴细胞浸润",
+        #         "基底膜": "基底膜局部中断，侵犯粘膜下层",
+        #         "completeness_score": 0.95
+        #     })
+        # else:
+        #     return "Gemini mock response"
 
     def _call_baichuan(self, prompt: str, **kwargs) -> str:
         """调用 Baichuan API"""
 
         # TODO: 实际 API 调用
-        # response = self.baichuan_session.post(
-        #     f"{self.config['baichuan']['api_base']}/chat/completions",
-        #     json={
-        #         "model": self.config['baichuan'].get('model', 'Baichuan4'),
-        #         "messages": [{"role": "user", "content": prompt}],
-        #         "temperature": kwargs.get("temperature", 0.7),
-        #         "max_tokens": kwargs.get("max_tokens", 1000)
-        #     }
-        # )
-        # result = response.json()
-        # return result["choices"][0]["message"]["content"]
+        response = self.baichuan_session.post(
+            f"https://api.baichuan-ai.com/v1/chat/completions",
+            json={
+                "model": self.config['baichuan'].get('model', 'Baichuan-M3'),
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": kwargs.get("temperature", 0.7),
+                "max_tokens": kwargs.get("max_tokens", 32000)
+            }
+        )
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
 
         # Mock 响应
-        logger.info("  🤖 [Baichuan] 模拟调用...")
-        if "审查" in prompt or "质量" in prompt:
-            return json.dumps({
-                "quality_score": 0.95,
-                "missing_fields": [],
-                "action": "PROCEED",
-                "suggestions": "描述完整，可进入诊断阶段"
-            })
-        elif "报告" in prompt:
-            return """
-                === 病理诊断报告 ===
-                
-                【标本信息】
-                来源组织：胃窦粘膜活检
-                染色方法：HE 染色
-                
-                【镜下所见】
-                腺体融合排列，背靠背模式，局部坏死
-                
-                【诊断意见】
-                肿瘤分型：中分化腺癌
-                浸润深度：肌层 (2.3 mm)
-                
-                【病理分期建议】
-                T2 (侵犯肌层)
-                """
-        else:
-            return "Baichuan mock response"
+        # logger.info("  🤖 [Baichuan] 模拟调用...")
+        # if "审查" in prompt or "质量" in prompt:
+        #     return json.dumps({
+        #         "quality_score": 0.95,
+        #         "missing_fields": [],
+        #         "action": "PROCEED",
+        #         "suggestions": "描述完整，可进入诊断阶段"
+        #     })
+        # elif "报告" in prompt:
+        #     return """
+        #         === 病理诊断报告 ===
+        #
+        #         【标本信息】
+        #         来源组织：胃窦粘膜活检
+        #         染色方法：HE 染色
+        #
+        #         【镜下所见】
+        #         腺体融合排列，背靠背模式，局部坏死
+        #
+        #         【诊断意见】
+        #         肿瘤分型：中分化腺癌
+        #         浸润深度：肌层 (2.3 mm)
+        #
+        #         【病理分期建议】
+        #         T2 (侵犯肌层)
+        #         """
+        # else:
+        #     return "Baichuan mock response"
 
     @staticmethod
     def parse_json_response(text: str) -> Dict:
